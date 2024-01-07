@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url" // 添加这一行
 	"os"
 	"strconv"
 	"sync/atomic"
 	"time"
+	"golang.org/x/net/proxy"// 添加这一行
+        "sync"// 添加这一行
 
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/gorilla/websocket"
@@ -32,10 +35,30 @@ var messageId atomic.Value
 var currentWorkers int32
 var arbRpcUrl string
 
+
+// 代理信息结构
+type ProxyInfo struct {
+    IP       string
+    Port     string
+    Username string
+    Password string
+}
+
+var proxies = []ProxyInfo{
+    {"ip1", "端口1", "用户名1", "密码1"},
+    {"ip2", "端口2", "用户名2", "密码2"},
+}
+
+var currentProxyIndex int
+var requestCount int
+var mutex sync.Mutex
+
 var (
 	ErrDifficultyTooLow = errors.New("nip13: insufficient difficulty")
 	ErrGenerateTimeout  = errors.New("nip13: generating proof of work took too long")
 )
+
+
 
 func init() {
 
@@ -47,6 +70,48 @@ func init() {
 	pk = os.Getenv("pk")
 	numberOfWorkers, _ = strconv.Atoi(os.Getenv("numberOfWorkers"))
 	arbRpcUrl = os.Getenv("arbRpcUrl")
+}
+
+// 轮询代理
+func getNextProxy() ProxyInfo {
+    mutex.Lock()
+    defer mutex.Unlock()
+    
+    if currentProxyIndex >= len(proxies) {
+        currentProxyIndex = 0
+    }
+    proxy := proxies[currentProxyIndex]
+    requestCount++
+    if requestCount >= 10 { // 每10个请求更换一次代理
+        currentProxyIndex++
+        requestCount = 0
+    }
+    return proxy
+}
+
+// 创建支持Socks5代理的HTTP客户端
+func createHttpClient(proxyInfo ProxyInfo) (*http.Client, error) {
+	log.Println("Entering createHttpClient")
+
+    proxyUrl := fmt.Sprintf("socks5://%s:%s@%s:%s", proxyInfo.Username, proxyInfo.Password, proxyInfo.IP, proxyInfo.Port)
+    proxyURI, err := url.Parse(proxyUrl)
+    if err != nil {
+        return nil, err
+    }
+
+    dialer, err := proxy.FromURL(proxyURI, proxy.Direct)
+    if err != nil {
+        return nil, err
+    }
+
+    transport := &http.Transport{
+        Dial: dialer.Dial,
+    }
+    log.Println("Exiting createHttpClient")
+
+    return &http.Client{
+        Transport: transport,
+    }, nil
 }
 
 func generateRandomString(length int) (string, error) {
@@ -126,6 +191,8 @@ func mine(ctx context.Context, messageId string, client *ethclient.Client) {
 	ev.Tags = ev.Tags.AppendUnique(nostr.Tag{"seq_witness", strconv.Itoa(int(blockNumber)), hash.Load().(string)})
 	// Start multiple worker goroutines
 	go func() {
+		log.Println("Starting new goroutine for mining")
+
 		select {
 		case <-ctx.Done():
 			return
@@ -169,6 +236,16 @@ func mine(ctx context.Context, messageId string, client *ethclient.Client) {
 		if err != nil {
 			log.Fatalf("Error marshaling wrapper: %v", err)
 		}
+		  // 获取下一个代理
+		  proxy := getNextProxy()
+		  httpClient, err := createHttpClient(proxy)
+		  if err != nil {
+			  log.Fatalf("Error creating proxy client: %v", err)
+		  }
+
+		   // 在这里添加日志
+		log.Printf("Using proxy: %s:%s\n", proxy.IP, proxy.Port)
+		fmt.Printf("Using proxy: %s:%s\n", proxy.IP, proxy.Port)
 
 		url := "https://api-worker.noscription.org/inscribe/postEvent"
 		// fmt.Print(bytes.NewBuffer(wrapperJSON))
@@ -187,9 +264,9 @@ func mine(ctx context.Context, messageId string, client *ethclient.Client) {
 		req.Header.Set("Sec-fetch-mode", "cors")
 		req.Header.Set("Sec-fetch-site", "same-site")
 
-		// 发送请求
-		client := &http.Client{}
-		resp, err := client.Do(req)
+
+    // 使用配置了代理的httpClient发送请求
+    resp, err := httpClient.Do(req)
 		if err != nil {
 			log.Fatalf("Error sending request: %v", err)
 		}
